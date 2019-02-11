@@ -1,0 +1,11 @@
+[package]
+name = "developer-challenge"
+version = "0.1.0"
+authors = ["Dylan McGannon <me@dyl.dog>"]
+edition = "2018"
+
+[dependencies]
+petgraph = "0.4.13"
+csv = "1"
+regex = "1"
+lazy_static = "1.2.0"
