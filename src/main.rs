@@ -1,27 +1,35 @@
 extern crate csv;
 extern crate petgraph;
 extern crate regex;
+extern crate rpn;
 #[macro_use]
 extern crate lazy_static;
+extern crate itertools;
 
 use csv::ReaderBuilder;
 use csv::StringRecord;
+use itertools::Itertools;
+use petgraph::algo::has_path_connecting;
+use petgraph::algo::is_cyclic_directed;
+use petgraph::graph::NodeIndex;
 use petgraph::Directed;
 use petgraph::Graph;
 use regex::Regex;
 use std::char;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 
-type Map = HashMap<(usize, usize), String>;
+type Map = BTreeMap<(usize, usize), String>;
 
+/// Read a CSV file in from the given filename and parse it's contents into a map.
 fn parse_csv(filename: String) -> Result<Map, Box<Error>> {
     let mut reader = ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
         .from_path(filename)?;
-    let mut map = HashMap::new();
+    let mut map = BTreeMap::new();
 
     for (i, result) in reader.records().enumerate() {
         map.extend(read_record(i, &result?));
@@ -29,6 +37,7 @@ fn parse_csv(filename: String) -> Result<Map, Box<Error>> {
     Ok(map)
 }
 
+/// Read a CSV StringRecord and parse it into a map representing given row index.
 fn read_record(row: usize, record: &StringRecord) -> Map {
     let mut map = Map::new();
     for (column, field) in record.iter().enumerate() {
@@ -37,38 +46,9 @@ fn read_record(row: usize, record: &StringRecord) -> Map {
     map
 }
 
-// fn build_graph_partition(
-//     map: &Map,
-//     cell: (usize, usize),
-// ) -> Result<Graph<&(usize, usize), u32, Directed>, String> {
-//     let expression = map.get(&cell).unwrap();
-//     let mut graph = Graph::<&(usize, usize), u32, Directed>::new();
-//     let parent_node = graph.add_node(&cell);
-//     let children = extract_cell_references(expression)?
-//         .into_iter()
-//         .map(|c| cell_reference_to_index(c).unwrap());
-//     for child in children {
-//         let child_node = graph.add_node(child);
-//         graph.add_edge(parent_node, child_node, 1);
-//     }
-
-//     Err("not implemented".to_string())
-// }
-
-fn evaluate_reverse_polish(input: &str) {}
-
-fn parse_arguments() -> Result<String, String> {
-    let mut args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        Err("No filename argument given.".to_string())
-    } else {
-        Ok(args.remove(1))
-    }
-}
-
 /// Convert a map index to a cell reference string, e.g. (3, 5) => "f4".
-fn index_to_cell_reference((row, column): (usize, usize)) -> Result<String, String> {
-    let column_name = match char::from_digit(column as u32 + 10, 36) {
+fn index_to_cell_reference((row, column): &(usize, usize)) -> Result<String, String> {
+    let column_name = match char::from_digit(*column as u32 + 10, 36) {
         Some(column_name) => column_name,
         None => return Err("Index out of bounds".to_string()),
     };
@@ -77,7 +57,7 @@ fn index_to_cell_reference((row, column): (usize, usize)) -> Result<String, Stri
     Ok(cell_reference)
 }
 
-// Convert a cell reference string to a map index, e.g. "e7" => (6, 4).
+/// Convert a cell reference string to a map index, e.g. "e7" => (6, 4).
 fn cell_reference_to_index(cell_reference: &str) -> Result<(usize, usize), String> {
     let attempt = |cell_reference: &str| -> Option<(usize, usize)> {
         let column_char = cell_reference.to_ascii_lowercase().chars().next()?;
@@ -101,8 +81,95 @@ fn cell_reference_to_index(cell_reference: &str) -> Result<(usize, usize), Strin
     }
 }
 
-/// Extract any cell references from a string, e.g. "1 a4 + 14 - h2" => ["a4", "h2"]
-fn extract_cell_references(string: &str) -> Result<Vec<&str>, String> {
+/// Construct a directed graph representing the map, then prune the nodes not connected to
+/// the node of interest.
+/// Return if the resultant graph contains a cycle.
+fn detect_cycle(map: &Map, cell_index: &(usize, usize)) -> Result<bool, String> {
+    let mut nodes = HashMap::<String, NodeIndex<u32>>::new();
+    let mut graph = Graph::<String, u32, Directed>::new();
+
+    // First pass to create the nodes
+    for (index, _) in map {
+        let cell_reference = index_to_cell_reference(index)?;
+        let node = graph.add_node(cell_reference.clone());
+        nodes.insert(cell_reference, node);
+    }
+
+    // Second pass to create the edges
+    for (index, expression) in map {
+        let current_node = nodes[&index_to_cell_reference(index)?];
+        for (child_cell_reference, _) in extract_cell_references_with_indexes(expression.as_str())?
+        {
+            let child_node = nodes[child_cell_reference];
+            graph.add_edge(current_node, child_node, 1);
+        }
+    }
+
+    // Third pass to prune edges not related to the node in question
+    let current_node = nodes[&index_to_cell_reference(cell_index)?];
+    let mut pruned_graph = graph.clone();
+    pruned_graph.retain_nodes(|_, n| has_path_connecting(&graph, current_node, n, None));
+
+    Ok(is_cyclic_directed(&graph))
+}
+
+/// Evaluate the given cell recusing as neccessary to produce a single value.
+/// This function assumes that there is no cycles in the references (i.e. that detect_cycle returns false).
+fn evaluate_recursive(
+    map: &Map,
+    solved_map: &mut Map,
+    cell_index: &(usize, usize),
+) -> Result<String, String> {
+    let expression = map
+        .get(cell_index)
+        .ok_or("Invalid cell reference".to_string())?
+        .to_owned();
+
+    if expression.trim().is_empty() {
+        solved_map.insert(cell_index.to_owned(), "0".to_string());
+        return Ok("0".to_string());
+    }
+    let children = extract_cell_references_with_indexes(expression.as_str())?;
+    let mut resolved_expression = expression.clone();
+
+    for (child_cell_reference, child_index) in children {
+        let child_result = evaluate_recursive(map, solved_map, &child_index)?;
+        resolved_expression =
+            resolved_expression.replace(child_cell_reference, child_result.as_str());
+    }
+    match rpn::evaluate(&resolved_expression) {
+        Ok(f) => {
+            let result = f.to_string();
+            solved_map.insert(cell_index.to_owned(), result);
+            Ok(f.to_string())
+        }
+        Err(_) => {
+            solved_map.insert(cell_index.to_owned(), "#ERR".to_string());
+            Err(format!(
+                "Unable to evaluate expression: {}",
+                resolved_expression
+            ))
+        }
+    }
+}
+
+/// Parse input arguments.
+/// Expecting only one argument to be given which will be used as the filename.
+fn parse_arguments() -> Result<String, String> {
+    let mut args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        Err("No filename argument given.".to_string())
+    } else {
+        Ok(args.remove(1))
+    }
+}
+
+/// Extract any cell references from a string,
+/// Then convert the string reference to an integer tuple.
+///  e.g. "1 a4 + 14 - h2" => [("a4", (3,0)), ("h2", (1, 7))]
+fn extract_cell_references_with_indexes(
+    string: &str,
+) -> Result<Vec<(&str, (usize, usize))>, String> {
     lazy_static! {
         static ref RE: Regex = Regex::new("([a-zA-Z]\\d+)").unwrap();
     }
@@ -111,24 +178,44 @@ fn extract_cell_references(string: &str) -> Result<Vec<&str>, String> {
         .captures_iter(string)
         .filter_map(|cap| cap.get(1))
         .map(|m| m.as_str())
+        .map(|m| (m, cell_reference_to_index(m).unwrap()))
         .collect::<Vec<_>>())
 }
 
+/// Print the given map in CSV format.
+fn print_csv(map: &Map) {
+    let rows = map.iter().group_by(|v| (v.0).0);
+    for (_key, group) in &rows {
+        let row = group.map(|v| v.1.to_owned()).collect::<Vec<_>>().join(",");
+        println!("{}", row);
+    }
+}
+
+/// Load the CSV file into a map, evaluate each cell, print the result as CSV.
 fn main() {
     let attempt = || -> Result<(), String> {
+        // Load csv file
         let filename = parse_arguments()?;
         let map = match parse_csv(filename) {
             Ok(map) => map,
             Err(error) => return Err(error.description().to_string()),
         };
-        for ((row, column), expression) in &map {
-            // let graph = build_graph_partition(&map, (*row, *column));
-            // check for cycles
-            // evaluate expressions bottom up.
-            // find and replace cell references with evaluated values (or #ERR on error)
-            println!("({}, {}) => {}", row, column, expression);
+
+        // Evaluate each cell
+        let mut solved_map = Map::new();
+        for (index, _) in &map {
+            if detect_cycle(&map, index)? {
+                eprintln!("Cycle detected.");
+                solved_map.insert(*index, "#ERR".to_string());
+            } else {
+                match evaluate_recursive(&map, &mut solved_map, index) {
+                    Ok(_) => (),
+                    Err(e) => eprintln!("{}", e),
+                };
+            }
         }
-        // Print final map as csv
+        // Print the solution as csv
+        print_csv(&solved_map);
         Ok(())
     };
 
@@ -143,14 +230,14 @@ mod tests {
 
     #[test]
     fn index_to_cell_reference_success() {
-        assert_eq!(index_to_cell_reference((1, 4)), Ok("e2".to_string()));
-        assert_eq!(index_to_cell_reference((3, 5)), Ok("f4".to_string()));
+        assert_eq!(index_to_cell_reference(&(1, 4)), Ok("e2".to_string()));
+        assert_eq!(index_to_cell_reference(&(3, 5)), Ok("f4".to_string()));
     }
 
     #[test]
     fn index_to_cell_reference_failure() {
         assert_eq!(
-            index_to_cell_reference((1, 26)),
+            index_to_cell_reference(&(1, 26)),
             Err("Index out of bounds".to_string())
         );
     }
